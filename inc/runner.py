@@ -2,13 +2,14 @@ import csv
 import logging
 import time
 
-from random import choice, randint
+from random import randint
 
 import numpy as np
 import undetected_chromedriver as uc
 
 from bs4 import BeautifulSoup
 from selenium.common.exceptions import (
+    MoveTargetOutOfBoundsException,
     NoSuchElementException,
     StaleElementReferenceException,
     TimeoutException,
@@ -19,7 +20,7 @@ from selenium.webdriver.support.wait import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 
-logging.basicConfig(level=logging.WARNING, filename='logs.log')
+logging.basicConfig(level=logging.DEBUG, filename='logs.log')
 
 
 SUMMARY_COLUMNS = ["Rank", "Company", "Description"]
@@ -27,6 +28,26 @@ DATA_COLUMNS = ["Industry", "Location", "Leadership", "Year Founded",
                 "Company Size", "Website", "LinkedIn", "Twitter", "Facebook",
                 "Key Clients", "Category Winner",]
 COLUMNS = SUMMARY_COLUMNS + DATA_COLUMNS + ["Growth"]
+
+
+def line_points(point1: tuple, point2: tuple):
+    divider = 10000
+    steps = randint(15, 25)
+    x1, y1 = point1[0] / divider, point1[1] / divider
+    x2, y2 = point2[0] / divider, point2[1] / divider
+    x = np.linspace(x1, x2, steps)
+    a = (y2 - y1) / (np.cosh(x2) - np.cosh(x1))
+    b = y1 - a * np.cosh(x1)
+    y = a * np.cosh(x) + b
+    return list(x * divider), list(y * divider)
+
+
+def to_xpath_string_literal(xpath_substring: str):
+    if "'" not in xpath_substring:
+        return f"'{xpath_substring}'"
+    if '"' not in xpath_substring:
+        return f'"{xpath_substring}"'
+    return "concat('%s')" % xpath_substring.replace("'", "',\"'\",'")
 
 
 class Runner:
@@ -38,25 +59,13 @@ class Runner:
         options.add_argument("--no-default-browser-check")
         self.driver = uc.Chrome(options=options)
 
-    @staticmethod
-    def _line_points(point1, point2):
-        divider = 10000
-        steps = randint(15, 25)
-        x1, y1 = point1[0] / divider, point1[1] / divider
-        x2, y2 = point2[0] / divider, point2[1] / divider
-        x = np.linspace(x1, x2, steps)
-        a = (y2 - y1) / (np.cosh(x2) - np.cosh(x1))
-        b = y1 - a * np.cosh(x1)
-        y = a * np.cosh(x) + b
-        return list(x * divider), list(y * divider)
-
-    def _curve_move(self, start_pos, element):
+    def _curve_move(self, start_pos: tuple, element):
         element_rect = element.rect
         stop_pos = (
             randint(int(element_rect['x']), int(element_rect['x'] + element_rect['width'])),
             randint(int(element_rect['y']), int(element_rect['y'] + element_rect['height'])),
         )
-        points = self._line_points(start_pos, stop_pos)
+        points = line_points(start_pos, stop_pos)
         points = zip(points[0], points[1])
         prev_x, prev_y = start_pos
         for point in points:
@@ -66,14 +75,34 @@ class Runner:
             prev_x, prev_y = point[0], point[1]
         return stop_pos
 
-    def _get_data(self, company_name):
+    def _get_data(self, company_name, scroll_to=False):
         result = []
-        company_container_el = WebDriverWait(self.driver, 30).until(
-            EC.presence_of_element_located((
-                By.XPATH,
-                f'//h2[contains(text(), "{company_name}")]/'
-                'ancestor::div[contains(@class, "company-profile")]'
-            ))
+        try:
+            company_container_el = WebDriverWait(self.driver, 30).until(
+                EC.presence_of_element_located((
+                    By.XPATH,
+                    f"//h2[contains(text(), {to_xpath_string_literal(company_name)})]/"
+                    "ancestor::div[contains(@class, 'company-profile')]"
+                ))
+            )
+        except TimeoutException:
+            logging.warning("For some reason data container for %s is unreachable")
+            return ['', company_name] + [''] * (len(COLUMNS) - 2)
+        if scroll_to:
+            logging.debug("Scroll to the bottom of container")
+            try:
+                ActionChains(self.driver)\
+                    .scroll_to_element(company_container_el)\
+                    .perform()
+            except MoveTargetOutOfBoundsException:
+                logging.warning(
+                    "MoveTargetOutOfBoundsException occured during scrolling to %s",
+                    company_name
+                )
+        company_container_el = self.driver.find_element(
+            By.XPATH,
+            f"//h2[contains(text(), {to_xpath_string_literal(company_name)})]/"
+            "ancestor::div[contains(@class, 'company-profile')]"
         )
         company_container_html = company_container_el.get_attribute("outerHTML")
         soup = BeautifulSoup(company_container_html, "html.parser")
@@ -82,7 +111,7 @@ class Runner:
         honors = soup.find("div", class_="company-honors")
 
         rank = summary.find("h2", class_="rank").text
-        result.append(rank.replace("No.", ""))
+        result.append(rank.replace("No.", "").replace(",", ""))
         result.append(summary.find("div", class_="headline-container").find("h2").string)
         result.append(summary.find("div", class_="summary-container").find("h3").string)
         for data in DATA_COLUMNS:
@@ -91,7 +120,11 @@ class Runner:
                 value.find_parent("div", class_="row")
                 .find("div", class_="details-container").string if value else ''
             )
-        result.append(honors.find("div", class_="standOut").find("em").string)
+        try:
+            growth = honors.find("div", class_="standOut").find("em").string
+        except AttributeError:
+            growth = ''
+        result.append(growth)
         return result
 
     def parse(self):
@@ -99,25 +132,16 @@ class Runner:
 
         try:
             # reset cursor position
-            html = WebDriverWait(self.driver, 30).until(
-                EC.presence_of_element_located((By.XPATH, "//html"))
+            logo = WebDriverWait(self.driver, 30).until(
+                EC.presence_of_element_located((By.XPATH, "//a[contains(@class, 'logo-link')]"))
             )
-            width, height = html.rect['width'], html.rect['height']
-            possible_offset = (
-                (-width / 2, -randint(0, (height // 2))),
-                (-randint(0, (width // 2)), -height // 2),
-            )
-            x_offset, y_offset = choice(possible_offset)
-            cursor_position = (width / 2 + x_offset, height / 2 + y_offset)
-            logging.warning(
-                "Reset cursor to position %s. Offset x: %s, y: %s. Window size: %s x %s",
-                cursor_position, x_offset, y_offset, width, height
-            )
-            ActionChains(self.driver)\
-                .move_to_element_with_offset(html, x_offset, y_offset)\
-                .perform()
+            width, height = logo.rect['width'], logo.rect['height']
+            x, y = logo.rect['x'], logo.rect['y']
+            cursor_position = (width / 2 + x, height / 2 + y)
+            logging.debug("Reset cursor to position %s", cursor_position)
+            ActionChains(self.driver).move_to_element(logo).perform()
 
-            logging.warning("Close cookies notification...")
+            logging.debug("Close cookies notification...")
             # close cookies notification
             cookies_notification = WebDriverWait(self.driver, 30).until(
                 EC.presence_of_element_located((
@@ -130,9 +154,10 @@ class Runner:
             ActionChains(self.driver)\
                 .pause(1)\
                 .click(cookies_notification)\
+                .pause(randint(2,5))\
                 .perform()
 
-            logging.warning("Move to first company in list and go to the next page...")
+            logging.debug("Move to first company in list and go to the next page...")
             # move to first company in list and go to the next page
             first_company = WebDriverWait(self.driver, 60).until(
                 EC.presence_of_element_located((
@@ -141,6 +166,7 @@ class Runner:
                 ))
             )
             company_name = first_company.get_attribute("textContent")
+            company_href = self.driver.current_url
             cursor_position = self._curve_move(cursor_position, first_company)
             ActionChains(self.driver)\
                 .pause(randint(1, 3))\
@@ -152,15 +178,16 @@ class Runner:
             with open(self.data_file, "a", encoding='utf-8') as data_file:
                 data_writer = csv.writer(data_file)
                 data_writer.writerow(COLUMNS)
-                logging.warning("Getting data...")
+                logging.debug("Getting data...")
                 while True:
                     time.sleep(randint(2, 4))
-                    row = self._get_data(company_name)
+                    logging.debug("Trying to get data for company %s...", company_name)
+                    row = self._get_data(company_name, scroll_to=company_href is None)
                     data_writer.writerow(row)
-                    logging.warning("VVV Collected row VVV")
-                    logging.warning(row)
-                    next_company_xpath = '//a[contains(@class, "fkoIAf")]/..'\
-                        '/following-sibling::div[1]/a/span[contains(@class, "name")]'
+                    logging.debug(row)
+                    next_company_xpath = "//span[contains(text(), "\
+                        f"{to_xpath_string_literal(company_name)})]/"\
+                        "../../following-sibling::div[1]/a/span[contains(@class, 'name')]"
                     next_company_attempt = 0
                     while next_company_attempt <= 3:
                         try:
@@ -170,28 +197,32 @@ class Runner:
                                 By.XPATH,
                                 '//a[contains(@class, "fkoIAf")]/../following-sibling::div[1]/a'
                             ).get_attribute("href")
-                            logging.warning("Company name: %s, href: %s",
-                                            company_name, company_href)
-                            logging.warning("Trying to move to %s. Attempt #%s",
-                                            company_name, next_company_attempt)
-                            ActionChains(self.driver).move_to_element(next_company)\
-                                .click().perform()
+                            logging.debug("Trying to move to %s. Attempt #%s",
+                                          company_name, next_company_attempt)
+                            action = ActionChains(self.driver).move_to_element(next_company)
+                            if company_href:
+                                action.click()
+                            action.perform()
+                            time.sleep(randint(2, 4))
                             break
-                        except StaleElementReferenceException:
-                            logging.error("Somehow it's stale. Company %s", company_name)
+                        except (MoveTargetOutOfBoundsException, StaleElementReferenceException):
+                            logging.warning("Somehow element is stale or out of clickable area."
+                                            " Company %s", company_name)
                             time.sleep(randint(3, 5))
                         next_company_attempt += 1
                     else:
-                        logging.error("It's not possible to move to next company (%s)",
+                        logging.error("It's not possible to move to the next company (%s)",
                                       company_name)
                         self.driver.close()
                         self.driver.quit()
-        except (NoSuchElementException, TimeoutException):
-            logging.exception("VVV An error occurred VVV")
+        except (NoSuchElementException,
+                StaleElementReferenceException,
+                TimeoutException):
+            logging.exception("An error occurred")
             self.driver.close()
             self.driver.quit()
 
-        logging.warning("Finished")
+        logging.debug("Finished")
 
 
 if __name__ == "__main__":
